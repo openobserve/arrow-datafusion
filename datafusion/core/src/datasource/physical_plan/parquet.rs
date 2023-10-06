@@ -101,6 +101,9 @@ pub struct ParquetExec {
     metadata_size_hint: Option<usize>,
     /// Optional user defined parquet file reader factory
     parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
+    /// Override for `Self::with_enable_bloom_filter`. If None, uses
+    /// values from base_config
+    enable_bloom_filter: Option<bool>,
 }
 
 impl ParquetExec {
@@ -163,6 +166,7 @@ impl ParquetExec {
             page_pruning_predicate,
             metadata_size_hint,
             parquet_file_reader_factory: None,
+            enable_bloom_filter: None,
         }
     }
 
@@ -244,6 +248,18 @@ impl ParquetExec {
     fn enable_page_index(&self, config_options: &ConfigOptions) -> bool {
         self.enable_page_index
             .unwrap_or(config_options.execution.parquet.enable_page_index)
+    }
+
+    /// If enabled, the reader will read the bloom filter
+    pub fn with_enable_bloom_filter(mut self, enable_bloom_filter: bool) -> Self {
+        self.enable_bloom_filter = Some(enable_bloom_filter);
+        self
+    }
+
+    /// Return the value described in [`Self::with_enable_bloom_filter`]
+    fn enable_bloom_filter(&self, config_options: &ConfigOptions) -> bool {
+        self.enable_bloom_filter
+            .unwrap_or(config_options.execution.parquet.bloom_filter_enabled)
     }
 
     /// Redistribute files across partitions according to their size
@@ -375,6 +391,7 @@ impl ExecutionPlan for ParquetExec {
             pushdown_filters: self.pushdown_filters(config_options),
             reorder_filters: self.reorder_filters(config_options),
             enable_page_index: self.enable_page_index(config_options),
+            enable_bloom_filter: self.enable_bloom_filter(config_options),
         };
 
         let stream =
@@ -408,6 +425,7 @@ struct ParquetOpener {
     pushdown_filters: bool,
     reorder_filters: bool,
     enable_page_index: bool,
+    enable_bloom_filter: bool,
 }
 
 impl FileOpener for ParquetOpener {
@@ -442,10 +460,13 @@ impl FileOpener for ParquetOpener {
             self.enable_page_index,
             &self.page_pruning_predicate,
         );
+        let enable_bloom_filter = self.enable_bloom_filter;
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            let options = ArrowReaderOptions::new().with_page_index(enable_page_index);
+            let options = ArrowReaderOptions::new()
+                .with_page_index(enable_page_index)
+                .with_bloom_filter(true);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                     .await?;
@@ -492,6 +513,7 @@ impl FileOpener for ParquetOpener {
                 file_range,
                 pruning_predicate.as_ref().map(|p| p.as_ref()),
                 &file_metrics,
+                enable_bloom_filter,
             );
 
             // page index pruning: if all data on individual pages can

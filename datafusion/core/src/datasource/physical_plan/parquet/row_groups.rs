@@ -15,6 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::datasource::physical_plan::parquet::{
+    from_bytes_to_i128, parquet_to_arrow_decimal_type,
+};
+use crate::physical_expr::expressions as phys_expr;
+use crate::physical_expr::split_conjunction;
+use crate::{
+    datasource::listing::FileRange,
+    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
+};
+use crate::{logical_expr::Operator, physical_plan::PhysicalExpr};
 use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Schema},
@@ -22,18 +32,10 @@ use arrow::{
 use datafusion_common::Column;
 use datafusion_common::ScalarValue;
 use log::debug;
-
 use parquet::file::{
     metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
 };
-
-use crate::datasource::physical_plan::parquet::{
-    from_bytes_to_i128, parquet_to_arrow_decimal_type,
-};
-use crate::{
-    datasource::listing::FileRange,
-    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
-};
+use std::sync::Arc;
 
 use super::ParquetFileMetrics;
 
@@ -49,6 +51,7 @@ pub(crate) fn prune_row_groups(
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
     metrics: &ParquetFileMetrics,
+    enable_bloom_filter: bool,
 ) -> Vec<usize> {
     let mut filtered = Vec::with_capacity(groups.len());
     for (idx, metadata) in groups.iter().enumerate() {
@@ -85,6 +88,41 @@ pub(crate) fn prune_row_groups(
                     metrics.predicate_evaluation_errors.add(1);
                 }
             }
+
+            // check bloom filter
+            if enable_bloom_filter {
+                let sbbf = metadata.bloom_filters();
+                let bloom_filter_predicates = BloomFilterPruningPredicate::try_new(
+                predicate.orig_expr(),
+            ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+                let mut need_skip = false;
+                for (filter_col, filter_val) in bloom_filter_predicates.predicates {
+                    let val = match filter_val {
+                        ScalarValue::Utf8(Some(v)) => v,
+                        ScalarValue::Int64(Some(v)) => v.to_string(),
+                        _ => continue,
+                    };
+                    if let Some((column_index, _)) =
+                        metadata.columns().iter().enumerate().find(|(_, column)| {
+                            column.column_path().string() == filter_col.name()
+                        })
+                    {
+                        if let Some(bf) = sbbf {
+                            if let Some(Some(bf)) = bf.get(column_index) {
+                                // NB: false means don't scan row group
+                                if !bf.check(&val.as_str()) {
+                                    need_skip = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if need_skip {
+                    metrics.row_groups_pruned.add(1);
+                    continue;
+                }
+            }
         }
 
         filtered.push(idx)
@@ -97,6 +135,51 @@ pub(crate) fn prune_row_groups(
 struct RowGroupPruningStatistics<'a> {
     row_group_metadata: &'a RowGroupMetaData,
     parquet_schema: &'a Schema,
+}
+
+#[derive(Debug)]
+pub(crate) struct BloomFilterPruningPredicate {
+    // Only predicates like `col = <constant>` can be applied to bloom filters
+    predicates: Vec<(phys_expr::Column, ScalarValue)>,
+}
+
+impl BloomFilterPruningPredicate {
+    pub fn try_new(expr: &Arc<dyn PhysicalExpr>) -> Result<Self, std::io::Error> {
+        let mut predicates = vec![];
+        for x in split_conjunction(expr) {
+            if let Some(bin_expr) = x.as_any().downcast_ref::<phys_expr::BinaryExpr>() {
+                if let Some(res) = check_expr_is_col_equal_const(bin_expr) {
+                    predicates.push(res)
+                }
+            }
+        }
+        Ok(Self { predicates })
+    }
+}
+
+fn check_expr_is_col_equal_const(
+    exr: &phys_expr::BinaryExpr,
+) -> Option<(phys_expr::Column, ScalarValue)> {
+    if Operator::Eq.ne(exr.op()) {
+        return None;
+    }
+
+    let left_any = exr.left().as_any();
+    let right_any = exr.right().as_any();
+
+    if let (Some(col), Some(liter)) = (
+        left_any.downcast_ref::<phys_expr::Column>(),
+        right_any.downcast_ref::<phys_expr::Literal>(),
+    ) {
+        return Some((col.clone(), liter.value().clone()));
+    }
+    if let (Some(liter), Some(col)) = (
+        left_any.downcast_ref::<phys_expr::Literal>(),
+        right_any.downcast_ref::<phys_expr::Column>(),
+    ) {
+        return Some((col.clone(), liter.value().clone()));
+    }
+    return None;
 }
 
 /// Extract the min/max statistics from a `ParquetStatistics` object
@@ -329,7 +412,13 @@ mod tests {
 
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(
+                &[rgm1, rgm2],
+                None,
+                Some(&pruning_predicate),
+                &metrics,
+                false
+            ),
             vec![1]
         );
     }
@@ -358,7 +447,13 @@ mod tests {
         // missing statistics for first row group mean that the result from the predicate expression
         // is null / undefined so the first row group can't be filtered out
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(
+                &[rgm1, rgm2],
+                None,
+                Some(&pruning_predicate),
+                &metrics,
+                false
+            ),
             vec![0, 1]
         );
     }
@@ -400,7 +495,7 @@ mod tests {
         // the first row group is still filtered out because the predicate expression can be partially evaluated
         // when conditions are joined using AND
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics, false),
             vec![1]
         );
 
@@ -413,7 +508,7 @@ mod tests {
         // if conditions in predicate are joined with OR and an unsupported expression is used
         // this bypasses the entire predicate expression and no row groups are filtered out
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics, false),
             vec![0, 1]
         );
     }
@@ -456,7 +551,7 @@ mod tests {
         let metrics = parquet_file_metrics();
         // First row group was filtered out because it contains no null value on "c2".
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics, false),
             vec![1]
         );
     }
@@ -482,7 +577,7 @@ mod tests {
         // bool = NULL always evaluates to NULL (and thus will not
         // pass predicates. Ideally these should both be false
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics, false),
             vec![1]
         );
     }
@@ -539,7 +634,8 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics
+                &metrics,
+                false
             ),
             vec![0, 2]
         );
@@ -602,7 +698,8 @@ mod tests {
                 &[rgm1, rgm2, rgm3, rgm4],
                 None,
                 Some(&pruning_predicate),
-                &metrics
+                &metrics,
+                false
             ),
             vec![0, 1, 3]
         );
@@ -649,7 +746,8 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics
+                &metrics,
+                false
             ),
             vec![1, 2]
         );
@@ -719,7 +817,8 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics
+                &metrics,
+                false
             ),
             vec![1, 2]
         );
@@ -778,7 +877,8 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics
+                &metrics,
+                false
             ),
             vec![1, 2]
         );
