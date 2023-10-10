@@ -377,7 +377,7 @@ mod tests {
 
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics,),
+            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
             vec![1]
         );
     }
@@ -406,7 +406,7 @@ mod tests {
         // missing statistics for first row group mean that the result from the predicate expression
         // is null / undefined so the first row group can't be filtered out
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics,),
+            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
             vec![0, 1]
         );
     }
@@ -587,7 +587,7 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics,
+                &metrics
             ),
             vec![0, 2]
         );
@@ -650,7 +650,7 @@ mod tests {
                 &[rgm1, rgm2, rgm3, rgm4],
                 None,
                 Some(&pruning_predicate),
-                &metrics,
+                &metrics
             ),
             vec![0, 1, 3]
         );
@@ -697,7 +697,7 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics,
+                &metrics
             ),
             vec![1, 2]
         );
@@ -767,7 +767,7 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics,
+                &metrics
             ),
             vec![1, 2]
         );
@@ -826,7 +826,7 @@ mod tests {
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
-                &metrics,
+                &metrics
             ),
             vec![1, 2]
         );
