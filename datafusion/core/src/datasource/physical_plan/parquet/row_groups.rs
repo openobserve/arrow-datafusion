@@ -15,16 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::datasource::physical_plan::parquet::{
-    from_bytes_to_i128, parquet_to_arrow_decimal_type,
-};
-use crate::physical_expr::expressions as phys_expr;
-use crate::physical_expr::split_conjunction;
-use crate::{
-    datasource::listing::FileRange,
-    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
-};
-use crate::{logical_expr::Operator, physical_plan::PhysicalExpr};
 use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Schema},
@@ -36,6 +26,17 @@ use parquet::file::{
     metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
 };
 use std::sync::Arc;
+
+use crate::datasource::physical_plan::parquet::{
+    from_bytes_to_i128, parquet_to_arrow_decimal_type,
+};
+use crate::physical_expr::expressions as phys_expr;
+use crate::physical_expr::split_conjunction;
+use crate::{
+    datasource::listing::FileRange,
+    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
+};
+use crate::{logical_expr::Operator, physical_plan::PhysicalExpr};
 
 use super::ParquetFileMetrics;
 
