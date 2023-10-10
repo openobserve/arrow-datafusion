@@ -51,7 +51,6 @@ pub(crate) fn prune_row_groups(
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
     metrics: &ParquetFileMetrics,
-    enable_bloom_filter: bool,
 ) -> Vec<usize> {
     let mut filtered = Vec::with_capacity(groups.len());
     for (idx, metadata) in groups.iter().enumerate() {
@@ -88,41 +87,6 @@ pub(crate) fn prune_row_groups(
                     metrics.predicate_evaluation_errors.add(1);
                 }
             }
-
-            // check bloom filter
-            // if enable_bloom_filter {
-            //     let sbbf = metadata.bloom_filters();
-            //     let bloom_filter_predicates = BloomFilterPruningPredicate::try_new(
-            //     predicate.orig_expr(),
-            // ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
-            //     let mut need_skip = false;
-            //     for (filter_col, filter_val) in bloom_filter_predicates.predicates {
-            //         let val = match filter_val {
-            //             ScalarValue::Utf8(Some(v)) => v,
-            //             ScalarValue::Int64(Some(v)) => v.to_string(),
-            //             _ => continue,
-            //         };
-            //         if let Some((column_index, _)) =
-            //             metadata.columns().iter().enumerate().find(|(_, column)| {
-            //                 column.column_path().string() == filter_col.name()
-            //             })
-            //         {
-            //             if let Some(bf) = sbbf {
-            //                 if let Some(Some(bf)) = bf.get(column_index) {
-            //                     // NB: false means don't scan row group
-            //                     if !bf.check(&val.as_str()) {
-            //                         need_skip = true;
-            //                         break;
-            //                     }
-            //                 }
-            //             }
-            //         }
-            //     }
-            //     if need_skip {
-            //         metrics.row_groups_pruned.add(1);
-            //         continue;
-            //     }
-            // }
         }
 
         filtered.push(idx)
@@ -140,7 +104,7 @@ struct RowGroupPruningStatistics<'a> {
 #[derive(Debug)]
 pub(crate) struct BloomFilterPruningPredicate {
     // Only predicates like `col = <constant>` can be applied to bloom filters
-    predicates: Vec<(phys_expr::Column, ScalarValue)>,
+    pub(crate) predicates: Vec<(phys_expr::Column, ScalarValue)>,
 }
 
 impl BloomFilterPruningPredicate {
@@ -412,13 +376,7 @@ mod tests {
 
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
-                &[rgm1, rgm2],
-                None,
-                Some(&pruning_predicate),
-                &metrics,
-                false
-            ),
+            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics,),
             vec![1]
         );
     }
@@ -447,13 +405,7 @@ mod tests {
         // missing statistics for first row group mean that the result from the predicate expression
         // is null / undefined so the first row group can't be filtered out
         assert_eq!(
-            prune_row_groups(
-                &[rgm1, rgm2],
-                None,
-                Some(&pruning_predicate),
-                &metrics,
-                false
-            ),
+            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics,),
             vec![0, 1]
         );
     }
@@ -495,7 +447,7 @@ mod tests {
         // the first row group is still filtered out because the predicate expression can be partially evaluated
         // when conditions are joined using AND
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics, false),
+            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
             vec![1]
         );
 
@@ -508,7 +460,7 @@ mod tests {
         // if conditions in predicate are joined with OR and an unsupported expression is used
         // this bypasses the entire predicate expression and no row groups are filtered out
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics, false),
+            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
             vec![0, 1]
         );
     }
@@ -551,7 +503,7 @@ mod tests {
         let metrics = parquet_file_metrics();
         // First row group was filtered out because it contains no null value on "c2".
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics, false),
+            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
             vec![1]
         );
     }
@@ -577,7 +529,7 @@ mod tests {
         // bool = NULL always evaluates to NULL (and thus will not
         // pass predicates. Ideally these should both be false
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics, false),
+            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
             vec![1]
         );
     }
@@ -635,7 +587,6 @@ mod tests {
                 None,
                 Some(&pruning_predicate),
                 &metrics,
-                false
             ),
             vec![0, 2]
         );
@@ -699,7 +650,6 @@ mod tests {
                 None,
                 Some(&pruning_predicate),
                 &metrics,
-                false
             ),
             vec![0, 1, 3]
         );
@@ -747,7 +697,6 @@ mod tests {
                 None,
                 Some(&pruning_predicate),
                 &metrics,
-                false
             ),
             vec![1, 2]
         );
@@ -818,7 +767,6 @@ mod tests {
                 None,
                 Some(&pruning_predicate),
                 &metrics,
-                false
             ),
             vec![1, 2]
         );
@@ -878,7 +826,6 @@ mod tests {
                 None,
                 Some(&pruning_predicate),
                 &metrics,
-                false
             ),
             vec![1, 2]
         );

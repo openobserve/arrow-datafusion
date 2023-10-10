@@ -36,6 +36,7 @@ use crate::{
         Statistics,
     },
 };
+use datafusion_common::ScalarValue;
 use datafusion_physical_expr::{
     ordering_equivalence_properties_helper, PhysicalSortExpr,
 };
@@ -464,10 +465,7 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            let options = ArrowReaderOptions::new()
-                .with_page_index(enable_page_index);
-                // .with_bloom_filter(true);
-                
+            let options = ArrowReaderOptions::new().with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                     .await?;
@@ -506,19 +504,63 @@ impl FileOpener for ParquetOpener {
                 };
             };
 
-            // Row group pruning: attempt to skip entire row_groups
+            // Row group pruning by statistics: attempt to skip entire row_groups
             // using metadata on the row groups
             let file_metadata = builder.metadata().clone();
-            let row_groups = row_groups::prune_row_groups(
+            let mut row_groups = row_groups::prune_row_groups(
                 file_metadata.row_groups(),
                 file_range,
                 pruning_predicate.as_ref().map(|p| p.as_ref()),
                 &file_metrics,
-                enable_bloom_filter,
             );
 
-            let bf_future = builder.get_row_group_bloom_filter(0,0);
-            let _bf = bf_future.await;
+            // Row group pruning by bloom filter: attempt to skip entire row_groups
+            // using bloom filters on the row groups
+            if enable_bloom_filter {
+                let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
+                if let Some(predicate) = predicate {
+                    let bf_predicates = row_groups::BloomFilterPruningPredicate::try_new(
+                        predicate.orig_expr(),
+                        ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+                    let mut new_row_groups = Vec::with_capacity(row_groups.len());
+                    for idx in row_groups {
+                        let mut need_skip = false;
+                        let rg_metadata = file_metadata.row_group(idx);
+                        for (col, val) in bf_predicates.predicates.iter() {
+                            let val = match val {
+                                ScalarValue::Utf8(Some(v)) => v.to_string(),
+                                ScalarValue::Int64(Some(v)) => v.to_string(),
+                                _ => continue,
+                            };
+                            if let Some((column_idx, _)) =
+                                rg_metadata.columns().iter().enumerate().find(
+                                    |(_, column)| {
+                                        column.column_path().string() == col.name()
+                                    },
+                                )
+                            {
+                                if let Some(bf) = builder
+                                    .get_row_group_bloom_filter(idx, column_idx)
+                                    .await?
+                                {
+                                    // NB: false means don't scan row group
+                                    if !bf.check(&val.as_str()) {
+                                        need_skip = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if need_skip {
+                            file_metrics.row_groups_pruned.add(1);
+                            continue;
+                        }
+                        new_row_groups.push(idx);
+                    }
+                    row_groups = new_row_groups;
+                }
+            }
+
             // page index pruning: if all data on individual pages can
             // be ruled using page metadata, rows from other columns
             // with that range can be skipped as well
