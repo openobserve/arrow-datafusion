@@ -90,39 +90,39 @@ pub(crate) fn prune_row_groups(
             }
 
             // check bloom filter
-            if enable_bloom_filter {
-                let sbbf = metadata.bloom_filters();
-                let bloom_filter_predicates = BloomFilterPruningPredicate::try_new(
-                predicate.orig_expr(),
-            ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
-                let mut need_skip = false;
-                for (filter_col, filter_val) in bloom_filter_predicates.predicates {
-                    let val = match filter_val {
-                        ScalarValue::Utf8(Some(v)) => v,
-                        ScalarValue::Int64(Some(v)) => v.to_string(),
-                        _ => continue,
-                    };
-                    if let Some((column_index, _)) =
-                        metadata.columns().iter().enumerate().find(|(_, column)| {
-                            column.column_path().string() == filter_col.name()
-                        })
-                    {
-                        if let Some(bf) = sbbf {
-                            if let Some(Some(bf)) = bf.get(column_index) {
-                                // NB: false means don't scan row group
-                                if !bf.check(&val.as_str()) {
-                                    need_skip = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if need_skip {
-                    metrics.row_groups_pruned.add(1);
-                    continue;
-                }
-            }
+            // if enable_bloom_filter {
+            //     let sbbf = metadata.bloom_filters();
+            //     let bloom_filter_predicates = BloomFilterPruningPredicate::try_new(
+            //     predicate.orig_expr(),
+            // ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+            //     let mut need_skip = false;
+            //     for (filter_col, filter_val) in bloom_filter_predicates.predicates {
+            //         let val = match filter_val {
+            //             ScalarValue::Utf8(Some(v)) => v,
+            //             ScalarValue::Int64(Some(v)) => v.to_string(),
+            //             _ => continue,
+            //         };
+            //         if let Some((column_index, _)) =
+            //             metadata.columns().iter().enumerate().find(|(_, column)| {
+            //                 column.column_path().string() == filter_col.name()
+            //             })
+            //         {
+            //             if let Some(bf) = sbbf {
+            //                 if let Some(Some(bf)) = bf.get(column_index) {
+            //                     // NB: false means don't scan row group
+            //                     if !bf.check(&val.as_str()) {
+            //                         need_skip = true;
+            //                         break;
+            //                     }
+            //                 }
+            //             }
+            //         }
+            //     }
+            //     if need_skip {
+            //         metrics.row_groups_pruned.add(1);
+            //         continue;
+            //     }
+            // }
         }
 
         filtered.push(idx)

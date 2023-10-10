@@ -465,8 +465,9 @@ impl FileOpener for ParquetOpener {
 
         Ok(Box::pin(async move {
             let options = ArrowReaderOptions::new()
-                .with_page_index(enable_page_index)
-                .with_bloom_filter(true);
+                .with_page_index(enable_page_index);
+                // .with_bloom_filter(true);
+                
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                     .await?;
@@ -507,7 +508,7 @@ impl FileOpener for ParquetOpener {
 
             // Row group pruning: attempt to skip entire row_groups
             // using metadata on the row groups
-            let file_metadata = builder.metadata();
+            let file_metadata = builder.metadata().clone();
             let row_groups = row_groups::prune_row_groups(
                 file_metadata.row_groups(),
                 file_range,
@@ -516,6 +517,8 @@ impl FileOpener for ParquetOpener {
                 enable_bloom_filter,
             );
 
+            let bf_future = builder.get_row_group_bloom_filter(0,0);
+            let _bf = bf_future.await;
             // page index pruning: if all data on individual pages can
             // be ruled using page metadata, rows from other columns
             // with that range can be skipped as well
