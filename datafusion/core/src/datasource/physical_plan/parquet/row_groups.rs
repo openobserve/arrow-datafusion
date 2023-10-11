@@ -19,28 +19,26 @@ use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Schema},
 };
-use datafusion_common::Column;
-use datafusion_common::ScalarValue;
-use log::debug;
+use datafusion_common::{Column, ScalarValue};
 use parquet::{
     arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
     file::{metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics},
 };
 use std::sync::Arc;
 
-use crate::datasource::physical_plan::parquet::{
-    from_bytes_to_i128, parquet_to_arrow_decimal_type,
+use crate::datasource::{
+    listing::FileRange,
+    physical_plan::parquet::{from_bytes_to_i128, parquet_to_arrow_decimal_type},
 };
-use crate::physical_expr::expressions as phys_expr;
-use crate::physical_expr::split_conjunction;
-use crate::{
-    datasource::listing::FileRange,
-    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
-};
-use crate::{logical_expr::Operator, physical_plan::PhysicalExpr};
+use crate::logical_expr::Operator;
+use crate::physical_expr::{expressions as phys_expr, split_conjunction};
+use crate::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
+use crate::physical_plan::PhysicalExpr;
 
 use super::ParquetFileMetrics;
 
+/// Prune row groups based on statistics
+///
 /// Returns a vector of indexes into `groups` which should be scanned.
 ///
 /// If an index is NOT present in the returned Vec it means the
@@ -48,7 +46,7 @@ use super::ParquetFileMetrics;
 ///
 /// If an index IS present in the returned Vec it means the predicate
 /// did not filter out that row group.
-pub(crate) fn prune_row_groups(
+pub(crate) fn prune_row_groups_by_statistics(
     groups: &[RowGroupMetaData],
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
@@ -85,7 +83,7 @@ pub(crate) fn prune_row_groups(
                 // stats filter array could not be built
                 // return a closure which will not filter out any row groups
                 Err(e) => {
-                    debug!("Error evaluating row group predicate values {e}");
+                    log::debug!("Error evaluating row group predicate values {e}");
                     metrics.predicate_evaluation_errors.add(1);
                 }
             }
@@ -96,21 +94,104 @@ pub(crate) fn prune_row_groups(
     filtered
 }
 
-/// Wraps parquet statistics in a way
-/// that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
-    row_group_metadata: &'a RowGroupMetaData,
-    parquet_schema: &'a Schema,
+/// Prune row groups by bloom filters
+///
+/// Returns a vector of indexes into `groups` which should be scanned.
+///
+/// If an index is NOT present in the returned Vec it means the
+/// predicate filtered all the row group.
+///
+/// If an index IS present in the returned Vec it means the predicate
+/// did not filter out that row group.
+pub(crate) async fn prune_row_groups_by_bloom_filters<
+    T: AsyncFileReader + Send + 'static,
+>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    row_groups: &[usize],
+    groups: &[RowGroupMetaData],
+    predicate: &PruningPredicate,
+    metrics: &ParquetFileMetrics,
+) -> Vec<usize> {
+    let bf_predicates = BloomFilterPruningPredicate::new(predicate.orig_expr());
+    let mut filtered = Vec::with_capacity(groups.len());
+    for idx in row_groups {
+        let mut need_skip = false;
+        let rg_metadata = &groups[*idx];
+        for (col, val) in bf_predicates.predicates.iter() {
+            // TODO: mutiple columns, and, or
+            let column_idx = match rg_metadata
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, column)| column.column_path().string() == col.name())
+            {
+                Some((column_idx, _)) => column_idx,
+                None => continue,
+            };
+            let bf = match builder
+                .get_row_group_column_bloom_filter(*idx, column_idx)
+                .await
+            {
+                Ok(bf) => match bf {
+                    Some(bf) => bf,
+                    None => {
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    log::debug!("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+                    metrics.predicate_evaluation_errors.add(1);
+                    continue;
+                }
+            };
+            // NB: false means don't scan row group
+            // TODO: the bf.check accept `T: AsBytes`
+            // TODO: list values, like: `where field in (1, 2, 3)`
+            match val {
+                ScalarValue::Utf8(Some(v)) => {
+                    if !bf.check(&v.as_str()) {
+                        need_skip = true;
+                    }
+                }
+                ScalarValue::Int16(Some(v)) => {
+                    if !bf.check(v) {
+                        need_skip = true;
+                    }
+                }
+                ScalarValue::Int32(Some(v)) => {
+                    if !bf.check(v) {
+                        need_skip = true;
+                    }
+                }
+                ScalarValue::Int64(Some(v)) => {
+                    if !bf.check(v) {
+                        need_skip = true;
+                    }
+                }
+                ScalarValue::Boolean(Some(v)) => {
+                    if !bf.check(v) {
+                        need_skip = true;
+                    }
+                }
+                _ => {}
+            };
+        }
+        if need_skip {
+            metrics.row_groups_pruned.add(1);
+            continue;
+        }
+        filtered.push(*idx);
+    }
+    filtered
 }
 
-#[derive(Debug)]
-pub(crate) struct BloomFilterPruningPredicate {
+struct BloomFilterPruningPredicate {
     // Only predicates like `col = <constant>` can be applied to bloom filters
-    pub(crate) predicates: Vec<(phys_expr::Column, ScalarValue)>,
+    predicates: Vec<(phys_expr::Column, ScalarValue)>,
 }
 
 impl BloomFilterPruningPredicate {
-    pub fn try_new(expr: &Arc<dyn PhysicalExpr>) -> Result<Self, std::io::Error> {
+    fn new(expr: &Arc<dyn PhysicalExpr>) -> Self {
         let mut predicates = vec![];
         for x in split_conjunction(expr) {
             if let Some(bin_expr) = x.as_any().downcast_ref::<phys_expr::BinaryExpr>() {
@@ -119,58 +200,8 @@ impl BloomFilterPruningPredicate {
                 }
             }
         }
-        Ok(Self { predicates })
+        Self { predicates }
     }
-}
-
-pub(crate) async fn prune_row_groups_by_bloom_filters<
-    T: AsyncFileReader + Send + 'static,
->(
-    groups: &[RowGroupMetaData],
-    predicate: &PruningPredicate,
-    row_groups: &[usize],
-    builder: &mut ParquetRecordBatchStreamBuilder<T>,
-    metrics: &ParquetFileMetrics,
-) -> Vec<usize> {
-    let bf_predicates = BloomFilterPruningPredicate::try_new(
-                        predicate.orig_expr(),
-                        ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
-    let mut new_row_groups = Vec::with_capacity(row_groups.len());
-    for idx in row_groups {
-        let mut need_skip = false;
-        let rg_metadata = &groups[*idx];
-        for (col, val) in bf_predicates.predicates.iter() {
-            let val = match val {
-                ScalarValue::Utf8(Some(v)) => v.to_string(),
-                ScalarValue::Int64(Some(v)) => v.to_string(),
-                _ => continue,
-            };
-            if let Some((column_idx, _)) = rg_metadata
-                .columns()
-                .iter()
-                .enumerate()
-                .find(|(_, column)| column.column_path().string() == col.name())
-            {
-                if let Some(bf) = builder
-                    .get_row_group_bloom_filter(*idx, column_idx)
-                    .await
-                    .unwrap()
-                {
-                    // NB: false means don't scan row group
-                    if !bf.check(&val.as_str()) {
-                        need_skip = true;
-                        continue;
-                    }
-                }
-            }
-        }
-        if need_skip {
-            metrics.row_groups_pruned.add(1);
-            continue;
-        }
-        new_row_groups.push(*idx);
-    }
-    new_row_groups
 }
 
 fn check_expr_is_col_equal_const(
@@ -196,6 +227,13 @@ fn check_expr_is_col_equal_const(
         return Some((col.clone(), liter.value().clone()));
     }
     return None;
+}
+
+/// Wraps parquet statistics in a way
+/// that implements [`PruningStatistics`]
+struct RowGroupPruningStatistics<'a> {
+    row_group_metadata: &'a RowGroupMetaData,
+    parquet_schema: &'a Schema,
 }
 
 /// Extract the min/max statistics from a `ParquetStatistics` object
@@ -428,7 +466,12 @@ mod tests {
 
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                &[rgm1, rgm2],
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![1]
         );
     }
@@ -457,7 +500,12 @@ mod tests {
         // missing statistics for first row group mean that the result from the predicate expression
         // is null / undefined so the first row group can't be filtered out
         assert_eq!(
-            prune_row_groups(&[rgm1, rgm2], None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                &[rgm1, rgm2],
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![0, 1]
         );
     }
@@ -499,7 +547,12 @@ mod tests {
         // the first row group is still filtered out because the predicate expression can be partially evaluated
         // when conditions are joined using AND
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                groups,
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![1]
         );
 
@@ -512,7 +565,12 @@ mod tests {
         // if conditions in predicate are joined with OR and an unsupported expression is used
         // this bypasses the entire predicate expression and no row groups are filtered out
         assert_eq!(
-            prune_row_groups(groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                groups,
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![0, 1]
         );
     }
@@ -555,7 +613,12 @@ mod tests {
         let metrics = parquet_file_metrics();
         // First row group was filtered out because it contains no null value on "c2".
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                &groups,
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![1]
         );
     }
@@ -581,7 +644,12 @@ mod tests {
         // bool = NULL always evaluates to NULL (and thus will not
         // pass predicates. Ideally these should both be false
         assert_eq!(
-            prune_row_groups(&groups, None, Some(&pruning_predicate), &metrics),
+            prune_row_groups_by_statistics(
+                &groups,
+                None,
+                Some(&pruning_predicate),
+                &metrics
+            ),
             vec![1]
         );
     }
@@ -634,7 +702,7 @@ mod tests {
         );
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
+            prune_row_groups_by_statistics(
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
@@ -697,7 +765,7 @@ mod tests {
         );
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
+            prune_row_groups_by_statistics(
                 &[rgm1, rgm2, rgm3, rgm4],
                 None,
                 Some(&pruning_predicate),
@@ -744,7 +812,7 @@ mod tests {
         );
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
+            prune_row_groups_by_statistics(
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
@@ -814,7 +882,7 @@ mod tests {
         );
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
+            prune_row_groups_by_statistics(
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),
@@ -873,7 +941,7 @@ mod tests {
         );
         let metrics = parquet_file_metrics();
         assert_eq!(
-            prune_row_groups(
+            prune_row_groups_by_statistics(
                 &[rgm1, rgm2, rgm3],
                 None,
                 Some(&pruning_predicate),

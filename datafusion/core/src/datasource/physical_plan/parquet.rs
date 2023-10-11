@@ -36,7 +36,6 @@ use crate::{
         Statistics,
     },
 };
-use datafusion_common::ScalarValue;
 use datafusion_physical_expr::{
     ordering_equivalence_properties_helper, PhysicalSortExpr,
 };
@@ -504,28 +503,28 @@ impl FileOpener for ParquetOpener {
                 };
             };
 
-            let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
             // Row group pruning by statistics: attempt to skip entire row_groups
             // using metadata on the row groups
             let file_metadata = builder.metadata().clone();
-            let mut row_groups = row_groups::prune_row_groups(
+            let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
+            let mut row_groups = row_groups::prune_row_groups_by_statistics(
                 file_metadata.row_groups(),
                 file_range,
                 predicate,
                 &file_metrics,
             );
 
-            if enable_bloom_filter {
-                if let Some(predicate) = predicate {
-                    row_groups = row_groups::prune_row_groups_by_bloom_filters(
-                        file_metadata.row_groups(),
-                        predicate,
-                        &row_groups,
-                        &mut builder,
-                        &file_metrics,
-                    )
-                    .await;
-                }
+            // Bloom filter pruning: if bloom filters are enabled and then attempt to skip entire row_groups
+            // using bloom filters on the row groups
+            if enable_bloom_filter && predicate.is_some() {
+                row_groups = row_groups::prune_row_groups_by_bloom_filters(
+                    &mut builder,
+                    &row_groups,
+                    file_metadata.row_groups(),
+                    predicate.unwrap(),
+                    &file_metrics,
+                )
+                .await;
             }
 
             // page index pruning: if all data on individual pages can
