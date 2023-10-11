@@ -504,60 +504,27 @@ impl FileOpener for ParquetOpener {
                 };
             };
 
+            let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
             // Row group pruning by statistics: attempt to skip entire row_groups
             // using metadata on the row groups
             let file_metadata = builder.metadata().clone();
             let mut row_groups = row_groups::prune_row_groups(
                 file_metadata.row_groups(),
                 file_range,
-                pruning_predicate.as_ref().map(|p| p.as_ref()),
+                predicate,
                 &file_metrics,
             );
 
-            // Row group pruning by bloom filter: attempt to skip entire row_groups
-            // using bloom filters on the row groups
             if enable_bloom_filter {
-                let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
                 if let Some(predicate) = predicate {
-                    let bf_predicates = row_groups::BloomFilterPruningPredicate::try_new(
-                        predicate.orig_expr(),
-                        ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
-                    let mut new_row_groups = Vec::with_capacity(row_groups.len());
-                    for idx in row_groups {
-                        let mut need_skip = false;
-                        let rg_metadata = file_metadata.row_group(idx);
-                        for (col, val) in bf_predicates.predicates.iter() {
-                            let val = match val {
-                                ScalarValue::Utf8(Some(v)) => v.to_string(),
-                                ScalarValue::Int64(Some(v)) => v.to_string(),
-                                _ => continue,
-                            };
-                            if let Some((column_idx, _)) =
-                                rg_metadata.columns().iter().enumerate().find(
-                                    |(_, column)| {
-                                        column.column_path().string() == col.name()
-                                    },
-                                )
-                            {
-                                if let Some(bf) = builder
-                                    .get_row_group_bloom_filter(idx, column_idx)
-                                    .await?
-                                {
-                                    // NB: false means don't scan row group
-                                    if !bf.check(&val.as_str()) {
-                                        need_skip = true;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        if need_skip {
-                            file_metrics.row_groups_pruned.add(1);
-                            continue;
-                        }
-                        new_row_groups.push(idx);
-                    }
-                    row_groups = new_row_groups;
+                    row_groups = row_groups::prune_row_groups_by_bloom_filters(
+                        file_metadata.row_groups(),
+                        predicate,
+                        &row_groups,
+                        &mut builder,
+                        &file_metrics,
+                    )
+                    .await;
                 }
             }
 

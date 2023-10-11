@@ -22,8 +22,9 @@ use arrow::{
 use datafusion_common::Column;
 use datafusion_common::ScalarValue;
 use log::debug;
-use parquet::file::{
-    metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
+use parquet::{
+    arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
+    file::{metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics},
 };
 use std::sync::Arc;
 
@@ -120,6 +121,56 @@ impl BloomFilterPruningPredicate {
         }
         Ok(Self { predicates })
     }
+}
+
+pub(crate) async fn prune_row_groups_by_bloom_filters<
+    T: AsyncFileReader + Send + 'static,
+>(
+    groups: &[RowGroupMetaData],
+    predicate: &PruningPredicate,
+    row_groups: &[usize],
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    metrics: &ParquetFileMetrics,
+) -> Vec<usize> {
+    let bf_predicates = BloomFilterPruningPredicate::try_new(
+                        predicate.orig_expr(),
+                        ).expect("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+    let mut new_row_groups = Vec::with_capacity(row_groups.len());
+    for idx in row_groups {
+        let mut need_skip = false;
+        let rg_metadata = &groups[*idx];
+        for (col, val) in bf_predicates.predicates.iter() {
+            let val = match val {
+                ScalarValue::Utf8(Some(v)) => v.to_string(),
+                ScalarValue::Int64(Some(v)) => v.to_string(),
+                _ => continue,
+            };
+            if let Some((column_idx, _)) = rg_metadata
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, column)| column.column_path().string() == col.name())
+            {
+                if let Some(bf) = builder
+                    .get_row_group_bloom_filter(*idx, column_idx)
+                    .await
+                    .unwrap()
+                {
+                    // NB: false means don't scan row group
+                    if !bf.check(&val.as_str()) {
+                        need_skip = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        if need_skip {
+            metrics.row_groups_pruned.add(1);
+            continue;
+        }
+        new_row_groups.push(*idx);
+    }
+    new_row_groups
 }
 
 fn check_expr_is_col_equal_const(
