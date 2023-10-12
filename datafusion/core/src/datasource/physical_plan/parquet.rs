@@ -516,7 +516,7 @@ impl FileOpener for ParquetOpener {
 
             // Bloom filter pruning: if bloom filters are enabled and then attempt to skip entire row_groups
             // using bloom filters on the row groups
-            if enable_bloom_filter && predicate.is_some() {
+            if enable_bloom_filter && !row_groups.is_empty() && predicate.is_some() {
                 row_groups = row_groups::prune_row_groups_by_bloom_filters(
                     &mut builder,
                     &row_groups,

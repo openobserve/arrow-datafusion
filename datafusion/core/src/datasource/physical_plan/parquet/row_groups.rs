@@ -19,19 +19,23 @@ use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Schema},
 };
-use datafusion_common::{Column, ScalarValue};
+use datafusion_common::{Column, DataFusionError, Result, ScalarValue};
 use parquet::{
     arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
+    bloom_filter::Sbbf,
     file::{metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics},
 };
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::datasource::{
     listing::FileRange,
     physical_plan::parquet::{from_bytes_to_i128, parquet_to_arrow_decimal_type},
 };
 use crate::logical_expr::Operator;
-use crate::physical_expr::{expressions as phys_expr, split_conjunction};
+use crate::physical_expr::expressions as phys_expr;
 use crate::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
 use crate::physical_plan::PhysicalExpr;
 
@@ -112,22 +116,33 @@ pub(crate) async fn prune_row_groups_by_bloom_filters<
     predicate: &PruningPredicate,
     metrics: &ParquetFileMetrics,
 ) -> Vec<usize> {
-    let bf_predicates = BloomFilterPruningPredicate::new(predicate.orig_expr());
+    let bf_predicates = match BloomFilterPruningPredicate::try_new(predicate.orig_expr())
+    {
+        Ok(predicates) => predicates,
+        Err(_) => {
+            return row_groups.to_vec();
+        }
+    };
     let mut filtered = Vec::with_capacity(groups.len());
     for idx in row_groups {
-        let mut need_skip = false;
         let rg_metadata = &groups[*idx];
-        for (col, val) in bf_predicates.predicates.iter() {
-            // TODO: mutiple columns, and, or
+        // get all columns bloom filter
+        let mut column_sbbf =
+            HashMap::with_capacity(bf_predicates.required_columns.len());
+        for column_name in bf_predicates.required_columns.iter() {
             let column_idx = match rg_metadata
                 .columns()
                 .iter()
                 .enumerate()
-                .find(|(_, column)| column.column_path().string() == col.name())
+                .find(|(_, column)| column.column_path().string().eq(column_name))
             {
                 Some((column_idx, _)) => column_idx,
                 None => continue,
             };
+            println!(
+                "get column bloom filter: {:?}, column_idx: {}",
+                column_name, column_idx
+            );
             let bf = match builder
                 .get_row_group_column_bloom_filter(*idx, column_idx)
                 .await
@@ -139,44 +154,16 @@ pub(crate) async fn prune_row_groups_by_bloom_filters<
                     }
                 },
                 Err(e) => {
-                    log::debug!("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
+                    log::error!("Error evaluating row group predicate values when using BloomFilterPruningPredicate {e}");
                     metrics.predicate_evaluation_errors.add(1);
                     continue;
                 }
             };
-            // NB: false means don't scan row group
-            // TODO: the bf.check accept `T: AsBytes`
-            // TODO: list values, like: `where field in (1, 2, 3)`
-            match val {
-                ScalarValue::Utf8(Some(v)) => {
-                    if !bf.check(&v.as_str()) {
-                        need_skip = true;
-                    }
-                }
-                ScalarValue::Int16(Some(v)) => {
-                    if !bf.check(v) {
-                        need_skip = true;
-                    }
-                }
-                ScalarValue::Int32(Some(v)) => {
-                    if !bf.check(v) {
-                        need_skip = true;
-                    }
-                }
-                ScalarValue::Int64(Some(v)) => {
-                    if !bf.check(v) {
-                        need_skip = true;
-                    }
-                }
-                ScalarValue::Boolean(Some(v)) => {
-                    if !bf.check(v) {
-                        need_skip = true;
-                    }
-                }
-                _ => {}
-            };
+            column_sbbf.insert(column_name.to_owned(), bf);
         }
-        if need_skip {
+        println!("get column bloom filter: {:?}", column_sbbf.len());
+        if bf_predicates.prune(&column_sbbf) {
+            println!("pruned row group [{}] by bloom filter", idx);
             metrics.row_groups_pruned.add(1);
             continue;
         }
@@ -186,21 +173,176 @@ pub(crate) async fn prune_row_groups_by_bloom_filters<
 }
 
 struct BloomFilterPruningPredicate {
-    // Only predicates like `col = <constant>` can be applied to bloom filters
-    predicates: Vec<(phys_expr::Column, ScalarValue)>,
+    /// Actual pruning predicate (rewritten in terms of column min/max statistics)
+    predicate_expr: Option<phys_expr::BinaryExpr>,
+    /// The statistics required to evaluate this predicate
+    required_columns: Vec<String>,
 }
 
 impl BloomFilterPruningPredicate {
-    fn new(expr: &Arc<dyn PhysicalExpr>) -> Self {
-        let mut predicates = vec![];
-        for x in split_conjunction(expr) {
-            if let Some(bin_expr) = x.as_any().downcast_ref::<phys_expr::BinaryExpr>() {
-                if let Some(res) = check_expr_is_col_equal_const(bin_expr) {
-                    predicates.push(res)
-                }
+    fn try_new(expr: &Arc<dyn PhysicalExpr>) -> Result<Self> {
+        match check_expr_op(expr.as_any().downcast_ref::<phys_expr::BinaryExpr>()) {
+            Some((expr, columns)) => Ok(Self {
+                predicate_expr: Some(expr),
+                required_columns: columns.into_iter().collect(),
+            }),
+            None => Err(DataFusionError::Execution(
+                "BloomFilterPruningPredicate only support binary expr".to_string(),
+            )),
+        }
+    }
+    fn prune(&self, column_sbbf: &HashMap<String, Sbbf>) -> bool {
+        prune_expr_with_bloom_filter(self.predicate_expr.as_ref(), column_sbbf)
+    }
+}
+
+/// filter the expr with bloom filter return true if the expr can be pruned
+fn prune_expr_with_bloom_filter(
+    expr: Option<&phys_expr::BinaryExpr>,
+    column_sbbf: &HashMap<String, Sbbf>,
+) -> bool {
+    if expr.is_none() {
+        return false;
+    }
+    println!("expr: {:?}", &expr);
+    let expr = expr.unwrap();
+    match expr.op() {
+        Operator::And => {
+            let left = prune_expr_with_bloom_filter(
+                expr.left().as_any().downcast_ref::<phys_expr::BinaryExpr>(),
+                column_sbbf,
+            );
+            let right = prune_expr_with_bloom_filter(
+                expr.right()
+                    .as_any()
+                    .downcast_ref::<phys_expr::BinaryExpr>(),
+                column_sbbf,
+            );
+            if left || right {
+                true
+            } else {
+                false
             }
         }
-        Self { predicates }
+        Operator::Or => {
+            let left = prune_expr_with_bloom_filter(
+                expr.left().as_any().downcast_ref::<phys_expr::BinaryExpr>(),
+                column_sbbf,
+            );
+            let right = prune_expr_with_bloom_filter(
+                expr.right()
+                    .as_any()
+                    .downcast_ref::<phys_expr::BinaryExpr>(),
+                column_sbbf,
+            );
+            if left && right {
+                true
+            } else {
+                false
+            }
+        }
+        Operator::Eq => {
+            if let Some((col, val)) = check_expr_is_col_equal_const(expr) {
+                if let Some(sbbf) = column_sbbf.get(col.name()) {
+                    match val {
+                        ScalarValue::Utf8(Some(v)) => !sbbf.check(&v.as_str()),
+                        ScalarValue::Boolean(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Float64(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Float32(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Int64(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Int32(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Int16(Some(v)) => !sbbf.check(&v),
+                        ScalarValue::Int8(Some(v)) => !sbbf.check(&v),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn check_expr_op(
+    expr: Option<&phys_expr::BinaryExpr>,
+) -> Option<(phys_expr::BinaryExpr, HashSet<String>)> {
+    if expr.is_none() {
+        return None;
+    }
+    let expr = expr.unwrap();
+    match expr.op() {
+        Operator::And => {
+            let left = check_expr_op(
+                expr.left().as_any().downcast_ref::<phys_expr::BinaryExpr>(),
+            );
+            let right = check_expr_op(
+                expr.right()
+                    .as_any()
+                    .downcast_ref::<phys_expr::BinaryExpr>(),
+            );
+            if left.is_some() && right.is_some() {
+                let left = left.unwrap();
+                let right = right.unwrap();
+                let mut columns = left.1;
+                columns.extend(right.1);
+                return Some((
+                    phys_expr::BinaryExpr::new(
+                        Arc::new(left.0),
+                        Operator::And,
+                        Arc::new(right.0),
+                    ),
+                    columns,
+                ));
+            } else if left.is_some() {
+                let left = left.unwrap();
+                return Some((left.0, left.1));
+            } else if right.is_some() {
+                let right = right.unwrap();
+                return Some((right.0, right.1));
+            } else {
+                return None;
+            }
+        }
+        Operator::Or => {
+            let left = check_expr_op(
+                expr.left().as_any().downcast_ref::<phys_expr::BinaryExpr>(),
+            );
+            let right = check_expr_op(
+                expr.right()
+                    .as_any()
+                    .downcast_ref::<phys_expr::BinaryExpr>(),
+            );
+            if left.is_some() && right.is_some() {
+                // only support both left and right are column equal const
+                let left = left.unwrap();
+                let right = right.unwrap();
+                let mut columns = left.1;
+                columns.extend(right.1);
+                return Some((
+                    phys_expr::BinaryExpr::new(
+                        Arc::new(left.0),
+                        Operator::Or,
+                        Arc::new(right.0),
+                    ),
+                    columns,
+                ));
+            } else {
+                return None;
+            }
+        }
+        Operator::Eq => {
+            if let Some(res) = check_expr_is_col_equal_const(expr) {
+                let mut columns = HashSet::new();
+                columns.insert(res.0.name().to_string());
+                Some((expr.clone(), columns))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
