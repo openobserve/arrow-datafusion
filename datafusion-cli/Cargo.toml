@@ -29,7 +29,7 @@ rust-version = "1.70"
 readme = "README.md"
 
 [dependencies]
-arrow = { path="../../arrow-rs/arrow", version = "47.0.0" }
+arrow = { git="https://github.com/apache/arrow-rs.git", rev = "90bc5ec96b5ae5162f469f9784dde7b1a53a5bdd", version = "47.0.0" }
 async-trait = "0.1.41"
 aws-config = "0.55"
 aws-credential-types = "0.55"
