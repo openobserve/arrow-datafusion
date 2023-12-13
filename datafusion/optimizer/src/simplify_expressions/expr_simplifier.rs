@@ -57,7 +57,7 @@ pub struct ExprSimplifier<S> {
     guarantees: Vec<(Expr, NullableInterval)>,
 }
 
-pub const THRESHOLD_INLINE_INLIST: usize = 3;
+pub const THRESHOLD_INLINE_INLIST: usize = 30;
 
 impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// Create a new `ExprSimplifier` with the given `info` such as an
